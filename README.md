@@ -1,4 +1,4 @@
-# BOX3D -- Parametric Box & Gridfinity Generator
+# BOX3D -- 3D Printable Box & Gridfinity Generator
 
 ## Overview
 <img width="1038" height="520" alt="Screenshot 2026-01-17 at 3 23 54 AM" src="https://github.com/user-attachments/assets/d7b5dee5-5905-4b1e-80e3-46d1ceb70111" />
