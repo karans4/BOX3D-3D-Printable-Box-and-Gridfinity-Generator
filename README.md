@@ -1,6 +1,7 @@
 # BOX3D -- Parametric Box & Gridfinity Generator
 
 ## Overview
+<img width="818" height="418" alt="Screenshot 2026-01-17 at 3 09 23 AM" src="https://github.com/user-attachments/assets/5b2f41c3-2b3b-4806-b19e-210fc245b981" />
 
 BOX3D is a React-based web application designed for generating 3D printable boxes and Gridfinity-compatible storage solutions. It features a real-time 3D visualization engine built with Three.js, allowing users to customize dimensions, structural parameters, and lid styles before exporting print-ready STL files.
 
