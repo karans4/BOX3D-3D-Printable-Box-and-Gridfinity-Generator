@@ -11,27 +11,34 @@ import { mergeBufferGeometries } from 'three/examples/jsm/utils/BufferGeometryUt
  * DO NOT DELETE, SIMPLIFY, OR IGNORE THESE COMMENTS.
  * ==========================================================================================
  * * --- ENGINEERING LOG ---
- * * 1. GRIDFINITY HEIGHT (STRICT STACKING COMPLIANCE):
- * - CONSTRAINT: "Units" defines the STACKING HEIGHT (Shoulder).
- * - 6U = 42mm Shoulder.
- * - Total Physical Height = 42mm + 4.4mm Lip = 46.4mm.
- * - This ensures 6U + 6U = 12U in a stack.
- * * 2. VISUALIZATION (CAD STYLE):
- * - Lines: `depthTest: false` ensures they render ON TOP of the model.
- * - Green: Body/Outer dimensions.
- * - Blue: Lid/Lip dimensions.
- * - Red: Internal Capacity.
- * * 3. LAYOUT ENGINE:
+ * * 1. FIXED-POINT ARITHMETIC (MICRON NATIVE):
+ * - SOURCE OF TRUTH: All 'config' state for dimensions is stored in INTERNAL UNITS (IU).
+ * - SCALE: 100,000 IU = 1.0 mm (10nm precision).
+ * - 1.0 Inch = 25.4 mm = 2,540,000 IU.
+ * - This prevents floating point drift and allows unit switching without physical resizing.
+ * * 2. LAYOUT ENGINE:
  * - Calculates geometry "Cursor" from Y=0 UPWARDS.
  * - Feet -> Floor -> Wall -> [Shoulder] -> Lip/Lid.
  * * ==========================================================================================
  */
 
-const GRID_SIZE_MM = 42.0;
-const GRID_Z_STEP_MM = 7.0; 
 const IN_TO_MM = 25.4;
 const MM_TO_IN = 1 / 25.4;
 const GEO_OVERLAP = 0.002; 
+
+// --- Precision Constants ---
+const IU_PER_MM = 100000;
+const IU_PER_IN = 2540000; // 25.4 * 100000
+
+// Convert Internal Units back to Scene Units (Inches) for Three.js
+const toScene = (iu) => {
+    const mm = iu / IU_PER_MM;
+    return mm * MM_TO_IN;
+};
+
+// Helper: Convert initial inch values to IU for state initialization
+const initIn = (val) => Math.round(val * IU_PER_IN);
+const initMm = (val) => Math.round(val * IU_PER_MM);
 
 // --- Helpers ---
 function createHexagonPath(x, y, radius) {
@@ -68,149 +75,157 @@ function createRoundedRectPath(width, height, radius) {
 function calculateConstraints(config) {
     const { 
         measureMode, appMode, gridfinityType,
-        width, depth, height, 
-        gridWidth, gridDepth, gridHeight,
-        wall, floor, 
-        lidEnabled, lidType, lidThickness, lipDepth 
+        width: width_IU, 
+        depth: depth_IU, 
+        height: height_IU, 
+        gridWidth, gridDepth, gridHeight, 
+        wall: wall_IU, 
+        floor: floor_IU, 
+        lidEnabled, lidType, 
+        lidThickness: lidThick_IU, 
+        lipDepth: lipDepth_IU,
+        tolerance: tolerance_IU
     } = config;
 
     const isGridfinity = appMode === 'gridfinity';
     
-    const layout = {
-        outerW: 0, outerD: 0, totalH: 0,
-        innerW: 0, innerD: 0, innerH: 0,
-        stack: { feet: null, floor: null, wall: null, rail: null, lip: null, lid: null },
-        valid: true,
-        errors: []
-    };
+    // Constants in IU
+    const grid42_IU = 42 * IU_PER_MM;
+    const grid7_IU = 7 * IU_PER_MM;
+    const lipHeight_IU = 440000; // 4.4mm * 100k
+    const railCapH_IU = 200000;  // 2.0mm * 100k
+    
+    // 1. Horizontal Plane
+    let outerW_IU = 0, outerD_IU = 0;
+    let innerW_IU = 0, innerD_IU = 0;
 
-    // 1. Horizontal Dimensions
     if (isGridfinity) {
-        layout.outerW = (gridWidth * GRID_SIZE_MM) * MM_TO_IN;
-        layout.outerD = (gridDepth * GRID_SIZE_MM) * MM_TO_IN;
-        layout.innerW = layout.outerW - (wall * 2);
-        layout.innerD = layout.outerD - (wall * 2);
+        outerW_IU = gridWidth * grid42_IU;
+        outerD_IU = gridDepth * grid42_IU;
+        innerW_IU = outerW_IU - (wall_IU * 2);
+        innerD_IU = outerD_IU - (wall_IU * 2);
     } else if (measureMode === 'internal') {
-        layout.innerW = width;
-        layout.innerD = depth;
-        layout.outerW = width + (wall * 2);
-        layout.outerD = depth + (wall * 2);
+        innerW_IU = width_IU;
+        innerD_IU = depth_IU;
+        outerW_IU = innerW_IU + (wall_IU * 2);
+        outerD_IU = innerD_IU + (wall_IU * 2);
     } else {
-        layout.outerW = width;
-        layout.outerD = depth;
-        layout.innerW = Math.max(0, width - (wall * 2));
-        layout.innerD = Math.max(0, depth - (wall * 2));
+        outerW_IU = width_IU;
+        outerD_IU = depth_IU;
+        innerW_IU = Math.max(0, outerW_IU - (wall_IU * 2));
+        innerD_IU = Math.max(0, outerD_IU - (wall_IU * 2));
     }
 
-    // Validation (Soft)
-    if (layout.innerW <= 0.01) { 
-        layout.valid = false; layout.errors.push("Width too narrow"); layout.innerW = 0.01;
-    }
-    if (layout.innerD <= 0.01) { 
-        layout.valid = false; layout.errors.push("Depth too narrow"); layout.innerD = 0.01; 
-    }
-
-    // 2. Vertical Stack
-    let currentY = 0; 
-
-    // A. Feet (Gridfinity Only)
-    const FOOT_HEIGHT_IN = 5.0 * MM_TO_IN;
+    // 2. Vertical Stack (Cursor)
+    let cursorY_IU = 0;
+    const stack = { feet: null, floor: null, wall: null, rail: null, lip: null, lid: null };
+    
+    // A. Feet
     if (isGridfinity && gridfinityType === 'bin') {
-        layout.stack.feet = { yMin: 0, yMax: FOOT_HEIGHT_IN };
-        currentY = FOOT_HEIGHT_IN - GEO_OVERLAP; 
+        const footH_IU = 500000; // 5mm
+        stack.feet = { yMin: 0, yMax: toScene(footH_IU) };
+        cursorY_IU = footH_IU; 
     }
 
     // B. Floor
-    layout.stack.floor = { yMin: currentY, yMax: currentY + floor };
-    currentY += floor - GEO_OVERLAP;
+    const floorStart_IU = cursorY_IU;
+    cursorY_IU += floor_IU;
+    stack.floor = { yMin: toScene(floorStart_IU), yMax: toScene(cursorY_IU) };
 
-    // C. Wall Height Logic
-    let targetWallH = 0;
-    const railCapH = 0.08; 
-    const railSpacerH = lidThickness + 0.02; 
-    const totalRailStack = railCapH + railSpacerH;
-    const LIP_HEIGHT_IN = 4.4 * MM_TO_IN;
-
+    // C. Wall Height
+    let targetWallH_IU = 0;
+    
     if (isGridfinity) {
-        // Gridfinity Stacking Logic:
-        // "Height" input is the Stacking Height (Shoulder).
-        const stackingHeight = (gridHeight * GRID_Z_STEP_MM) * MM_TO_IN;
-        
-        // Wall fills gap from Floor Top to Stacking Height
-        targetWallH = stackingHeight - currentY; // currentY is Floor Top (approx)
-        
-        // Store stacking height for dimensions
-        layout.bodyH = stackingHeight;
+        const stackingHeight_IU = gridHeight * grid7_IU; 
+        targetWallH_IU = Math.max(100000, stackingHeight_IU - cursorY_IU);
+        stack.bodyH = toScene(stackingHeight_IU);
     } 
     else if (measureMode === 'internal') {
-        let capacity = height;
+        // INTERNAL MODE: height_IU is usable capacity.
+        targetWallH_IU = height_IU;
+        // If Step Lid, add insert depth so usable capacity remains true
         if (lidEnabled && lidType === 'step') {
-            capacity += lipDepth; 
+            targetWallH_IU += lipDepth_IU;
         }
-        targetWallH = capacity;
     } 
     else {
-        // External
+        // EXTERNAL MODE
+        let nonWallStack_IU = cursorY_IU; 
+        
         if (lidEnabled && lidType === 'slide') {
-            targetWallH = height - (currentY) - totalRailStack;
+             // Rail Spacer gap = Lid Thickness + Tolerance
+             const railSpacer_IU = lidThick_IU + tolerance_IU; 
+             const totalRail_IU = railCapH_IU + railSpacer_IU;
+             nonWallStack_IU += totalRail_IU;
         } else if (lidEnabled && lidType === 'step') {
-            targetWallH = height - (currentY) - lidThickness;
-        } else {
-            targetWallH = height - currentY;
+             nonWallStack_IU += lidThick_IU;
         }
+
+        targetWallH_IU = Math.max(100000, height_IU - nonWallStack_IU);
     }
 
-    if (targetWallH < 0.04) {
-         layout.valid = false; 
-         layout.errors.push("Height too short");
-         targetWallH = 0.04;
-    }
-
-    layout.stack.wall = { yMin: currentY, yMax: currentY + targetWallH };
-    currentY += targetWallH;
+    const wallStart_IU = cursorY_IU;
+    cursorY_IU += targetWallH_IU;
+    stack.wall = { yMin: toScene(wallStart_IU), yMax: toScene(cursorY_IU) };
 
     // D. Top Features
     if (isGridfinity) {
-        // Lip sits on top of Body (Stacking Height)
-        layout.stack.lip = { yMin: currentY - GEO_OVERLAP, yMax: currentY + LIP_HEIGHT_IN };
-        currentY += LIP_HEIGHT_IN;
-    } 
+        const lipStart_IU = cursorY_IU; 
+        cursorY_IU += lipHeight_IU;
+        stack.lip = { yMin: toScene(lipStart_IU), yMax: toScene(cursorY_IU) };
+    }
     else if (lidEnabled && !isGridfinity) {
         if (lidType === 'slide') {
-            const spacerY = currentY - GEO_OVERLAP;
-            const capY = spacerY + railSpacerH - GEO_OVERLAP;
-            layout.stack.rail = { 
-                spacer: { yMin: spacerY, yMax: spacerY + railSpacerH },
-                cap: { yMin: capY, yMax: capY + railCapH }
-            };
+            // Gap logic: Gap = Thickness + Tolerance
+            const spacerH_IU = lidThick_IU + tolerance_IU; 
+            const spacerStart_IU = cursorY_IU;
+            cursorY_IU += spacerH_IU;
             
-            layout.stack.lid = {
-                yPos: currentY, 
-                type: 'slide',
-                thickness: lidThickness,
-                width: layout.outerW - wall - 0.02,
-                depth: layout.outerD - 0.02
+            const capStart_IU = cursorY_IU;
+            cursorY_IU += railCapH_IU;
+
+            stack.rail = { 
+                spacer: { yMin: toScene(spacerStart_IU), yMax: toScene(spacerStart_IU + spacerH_IU) },
+                cap: { yMin: toScene(capStart_IU), yMax: toScene(capStart_IU + railCapH_IU) }
             };
 
-            currentY = capY + railCapH;
-        } 
-        else if (lidType === 'step') {
-            layout.stack.lid = {
-                yPos: currentY, 
-                type: 'step',
-                thickness: lidThickness,
-                insertDepth: lipDepth,
-                width: layout.outerW,
-                depth: layout.outerD
+            // Lid Dimensions with Tolerance
+            stack.lid = {
+                yPos: toScene(spacerStart_IU + (lidThick_IU/2)), // Visual center inside gap (ignores loose tolerance drop)
+                type: 'slide',
+                thickness: toScene(lidThick_IU),
+                // Width: Outer Width - Wall - Tolerance
+                width: toScene(outerW_IU - wall_IU - tolerance_IU), 
+                // Depth: Outer Depth - Tolerance (clearance for sliding mechanism if any, usually flush with back/front but loose)
+                depth: toScene(outerD_IU - tolerance_IU)
             };
-            currentY += lidThickness;
+        }
+        else if (lidType === 'step') {
+            const lidStart_IU = cursorY_IU;
+            stack.lid = {
+                yPos: toScene(lidStart_IU),
+                type: 'step',
+                thickness: toScene(lidThick_IU),
+                insertDepth: toScene(lipDepth_IU),
+                width: toScene(outerW_IU),
+                depth: toScene(outerD_IU)
+            };
+            cursorY_IU += lidThick_IU;
         }
     }
 
-    layout.totalH = currentY;
-    layout.innerH = layout.stack.wall.yMax - layout.stack.floor.yMax;
-
-    return layout;
+    return {
+        outerW: toScene(outerW_IU),
+        outerD: toScene(outerD_IU),
+        innerW: toScene(innerW_IU),
+        innerD: toScene(innerD_IU),
+        totalH: toScene(cursorY_IU),
+        innerH: toScene(stack.wall.yMax - stack.floor.yMax),
+        bodyH: stack.bodyH, 
+        stack: stack,
+        valid: true,
+        errors: []
+    };
 }
 
 function generateSTL(scene) {
@@ -283,7 +298,8 @@ function SegmentedControl({ options, value, onChange, disabled }) {
 function ControlInput({ label, value, min, max, step, onChange, unitLabel, error, warning, description, disabled }) {
     const isInch = unitLabel === 'in'; 
     const format = (v) => {
-        if (!unitLabel) return Math.round(v).toString(); 
+        if (unitLabel === '%') return Math.round(v).toString();
+        // If MM, usually 1 decimal is enough. If Inch, 3 decimals.
         return unitLabel === 'in' ? v.toFixed(3) : v.toFixed(1);
     };
 
@@ -358,80 +374,91 @@ export default function App() {
   const [appMode, setAppMode] = useState('in'); 
   const [showMeasure, setShowMeasure] = useState(true);
   
-  // DEFAULT CONFIG (3.5 x 5.5 x 2.5)
+  // DEFAULT CONFIG (Micron Native)
   const [config, setConfig] = useState({
       measureMode: 'internal',
       gridfinityType: 'bin', 
       lidEnabled: false,
       lidType: 'step', 
-      width: 3.5,  
-      depth: 5.5, 
-      height: 2.5,
-      wall: 0.08, 
-      floor: 0.08,
-      lidThickness: 0.08,
-      lipDepth: 0.15,
-      tolerance: 0.01,
+      
+      width: initIn(3.5),  
+      depth: initIn(5.5), 
+      height: initIn(2.5),
+      
+      wall: initIn(0.08), 
+      floor: initIn(0.08),
+      lidThickness: initIn(0.08),
+      lipDepth: initIn(0.15),
+      tolerance: initIn(0.01),
+      
+      holeSize: initIn(0.25),
+      
       gridWidth: 2,
       gridDepth: 3,
       gridHeight: 6, 
       holes: false,
-      holeSize: 0.25 
+      infill: 0.50
   });
 
   const updateConfig = (key, value) => {
-      if (typeof value === 'number' && (isNaN(value) || value < 0)) return;
-      setConfig(prev => ({ ...prev, [key]: value }));
+      if (typeof value === 'number') {
+          if (isNaN(value) || value < 0) return;
+          setConfig(prev => ({ ...prev, [key]: value }));
+      } else {
+          setConfig(prev => ({ ...prev, [key]: value }));
+      }
   };
 
-  const getDisplayProps = (key, minIn, maxIn, stepIn) => {
-      const val = config[key];
+  const getDisplayProps = (key, minIn, maxIn) => {
+      const valIU = config[key];
       if (appMode === 'mm') {
           return {
-              value: val * IN_TO_MM,
-              min: minIn * IN_TO_MM,
-              max: maxIn * IN_TO_MM,
-              step: stepIn * IN_TO_MM,
+              value: valIU / IU_PER_MM,
+              min: minIn * 25.4,
+              max: maxIn * 25.4,
+              step: 1.0, 
               unitLabel: 'mm',
-              onChange: (v) => updateConfig(key, v * MM_TO_IN) 
+              onChange: (v) => updateConfig(key, Math.round(v * IU_PER_MM))
+          };
+      } else {
+          return {
+              value: valIU / IU_PER_IN,
+              min: minIn,
+              max: maxIn,
+              step: 0.125, 
+              unitLabel: 'in',
+              onChange: (v) => updateConfig(key, Math.round(v * IU_PER_IN))
           };
       }
-      return {
-          value: val,
-          min: minIn,
-          max: maxIn,
-          step: stepIn,
-          unitLabel: 'in',
-          onChange: (v) => updateConfig(key, v)
-      };
+  };
+
+  const getStructProps = (key, minIn, maxIn) => {
+      const valIU = config[key];
+      if (appMode === 'mm' || appMode === 'gridfinity') { 
+          return {
+              value: valIU / IU_PER_MM,
+              min: minIn * 25.4,
+              max: maxIn * 25.4,
+              step: 0.1, // Finer step for tolerances
+              unitLabel: 'mm',
+              onChange: (v) => updateConfig(key, Math.round(v * IU_PER_MM))
+          };
+      } else {
+          return {
+              value: valIU / IU_PER_IN,
+              min: minIn,
+              max: maxIn,
+              step: 0.005, 
+              unitLabel: 'in',
+              onChange: (v) => updateConfig(key, Math.round(v * IU_PER_IN))
+          };
+      }
   };
 
   const isGridfinity = appMode === 'gridfinity';
-  // Define isMM locally for use in labels
+  // DEFINED for Labels
   const isMM = appMode === 'mm' || isGridfinity; 
-
-  const getStructProps = (key, minIn, maxIn, stepIn) => {
-      const val = config[key];
-      if (isMM) {
-          return {
-              value: val * IN_TO_MM,
-              min: minIn * IN_TO_MM,
-              max: maxIn * IN_TO_MM,
-              step: 0.1, 
-              unitLabel: 'mm',
-              onChange: (v) => updateConfig(key, v * MM_TO_IN) 
-          };
-      }
-      return {
-          value: val,
-          min: minIn,
-          max: maxIn,
-          step: stepIn,
-          unitLabel: 'in',
-          onChange: (v) => updateConfig(key, v)
-      };
-  };
-
+  
   const layout = useMemo(() => calculateConstraints({ ...config, appMode }), [config, appMode]);
 
   const handleExport = () => {
@@ -444,8 +471,8 @@ export default function App() {
     if (isGridfinity) {
         name = `gridfinity_${config.gridWidth}x${config.gridDepth}x${config.gridHeight}U`;
     } else {
-        const w = appMode === 'mm' ? (config.width * IN_TO_MM).toFixed(0) : config.width.toFixed(2);
-        const d = appMode === 'mm' ? (config.depth * IN_TO_MM).toFixed(0) : config.depth.toFixed(2);
+        const w = appMode === 'mm' ? (config.width / IU_PER_MM).toFixed(0) : (config.width / IU_PER_IN).toFixed(2);
+        const d = appMode === 'mm' ? (config.depth / IU_PER_MM).toFixed(0) : (config.depth / IU_PER_IN).toFixed(2);
         name = `box_${w}x${d}${appMode}`;
     }
     link.download = `${name}.stl`;
@@ -485,6 +512,11 @@ export default function App() {
     dirLight.position.set(10, 20, 10);
     dirLight.castShadow = true;
     scene.add(dirLight);
+
+    const bottomLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    bottomLight.position.set(-10, -20, -10);
+    bottomLight.lookAt(0,0,0);
+    scene.add(bottomLight);
     
     const gridHelper = new THREE.GridHelper(100, 100, 0x374151, 0x1f2937);
     scene.add(gridHelper);
@@ -526,7 +558,7 @@ export default function App() {
     }
 
     const { outerW, outerD, stack } = layout;
-    const { wall, holes, holeSize, gridfinityType, lidEnabled, lidType } = config;
+    const { wall, holes, holeSize, gridfinityType, lidEnabled, lidType, infill } = config;
 
     const material = new THREE.MeshStandardMaterial({ 
         color: "#3b82f6", roughness: 0.5, metalness: 0.1
@@ -549,7 +581,7 @@ export default function App() {
     if (isGridfinity && gridfinityType === 'frame') {
         const unitsX = config.gridWidth;
         const unitsZ = config.gridDepth;
-        const GRID_IN = GRID_SIZE_MM * MM_TO_IN;
+        const GRID_IN = 42 * MM_TO_IN; 
         const frameH = 5.0 * MM_TO_IN;
         
         const frameShape = new THREE.Shape();
@@ -600,7 +632,7 @@ export default function App() {
     if (stack.feet) {
         const unitsX = config.gridWidth;
         const unitsZ = config.gridDepth;
-        const GRID_IN = GRID_SIZE_MM * MM_TO_IN;
+        const GRID_IN = 42.0 * MM_TO_IN;
         const topH = (2.15 * MM_TO_IN) + GEO_OVERLAP;
         const botH = (2.85 * MM_TO_IN) + GEO_OVERLAP;
         
@@ -649,9 +681,10 @@ export default function App() {
     if (stack.wall) {
         const h = stack.wall.yMax - stack.wall.yMin + GEO_OVERLAP;
         const y = stack.wall.yMin - GEO_OVERLAP;
+        
+        const wallThick = toScene(config.wall);
 
         if (holes) {
-            // --- PATTERNED WALLS (4 separate meshes with boolean-style holes in 2D) ---
             const createPerforatedWall = (w, height, thick) => {
                 const shape = new THREE.Shape();
                 shape.moveTo(-w/2, 0);
@@ -660,13 +693,12 @@ export default function App() {
                 shape.lineTo(-w/2, height);
                 shape.lineTo(-w/2, 0);
 
-                const hexR = holeSize / 2;
-                const hexW = hexR * Math.sqrt(3);
-                const hexH = hexR * 2;
-                const spacingX = hexW * 1.05; // Tight packing
-                const spacingY = hexH * 0.8; // 30-60-90 triangle stacking
+                const hexR = toScene(config.holeSize) / 2;
+                const voidFraction = 1 - Math.min(0.99, Math.max(0.01, infill));
+                const centerSpacing = hexR * Math.sqrt(3 / voidFraction);
+                const spacingX = centerSpacing;
+                const spacingY = centerSpacing * Math.sqrt(3) / 2;
 
-                // Grid logic
                 const margin = thick * 1.5;
                 const availW = w - (margin * 2);
                 const availH = height - (margin * 2);
@@ -682,13 +714,10 @@ export default function App() {
                         for(let c=0; c<cols; c++) {
                             const isOddRow = r % 2 === 1;
                             const offsetX = isOddRow ? spacingX / 2 : 0;
-                            // Don't add if odd row pushes it out
                             if (isOddRow && c === cols - 1) continue; 
 
                             const cx = startX + (c * spacingX) + offsetX;
                             const cy = startY + (r * spacingY);
-                            
-                            // Bounds Check
                             if (cx > w/2 - margin || cy > height - margin) continue;
 
                             const hex = createHexagonPath(cx, cy, hexR);
@@ -696,43 +725,19 @@ export default function App() {
                         }
                     }
                 }
-
-                const geo = new THREE.ExtrudeGeometry(shape, { depth: thick, bevelEnabled: false });
-                return geo;
+                return new THREE.ExtrudeGeometry(shape, { depth: thick, bevelEnabled: false });
             };
 
-            // Front & Back (Full Width)
-            const fbGeo = createPerforatedWall(outerW, h, wall);
-            // Position: Center of wall thickness should align with outerD edge?
-            // Extrude creates depth +Z.
-            // Front Wall: At +outerD/2. We want outer face at +D/2. So mesh at D/2 - wall.
-            addMesh(fbGeo, boxOffsetX, y, outerD/2 - wall, 0, 0); // Front (Inner face at D/2-w, Outer at D/2) -> No, extrude is +Z.
-                                                                  // If we place at Z, extrude goes to Z+Thick. 
-                                                                  // We want outer face at outerD/2. So Z = outerD/2 - wall.
-            
-            // Back Wall: At -outerD/2. We want outer face at -D/2. So mesh at -D/2, extrude to -D/2+wall.
-            // Wait, let's rotate back wall 180 to face out? Or just place it.
-            // Let's place it at -outerD/2.
+            const fbGeo = createPerforatedWall(outerW, h, wallThick);
+            addMesh(fbGeo, boxOffsetX, y, outerD/2 - wallThick, 0, 0); 
             addMesh(fbGeo, boxOffsetX, y, -outerD/2, 0, 0); 
 
-            // Left & Right (Inset by wall thickness to avoid overlap)
-            // Width = outerD - 2*wall
-            const sideW = outerD - (wall * 2.05); // slight gap for tolerance visually
-            const lrGeo = createPerforatedWall(sideW, h, wall);
-            
-            // Right Wall (+X): Rotated -90 deg around Y? 
-            // Shape is in XY. Rotate Y -90 -> Shape in YZ (facing -X). Extrude in -X.
-            // Let's keep it simple. Rotate Y 90. Shape in YZ (facing +X). Extrude +X.
-            // We want outer face at outerW/2. So place at outerW/2 - wall.
-            addMesh(lrGeo, boxOffsetX + outerW/2 - wall, y, 0, 0, Math.PI/2);
-
-            // Left Wall (-X):
-            // Place at -outerW/2. Extrude +X to -outerW/2 + wall.
+            const sideW = outerD - (wallThick * 2.05); 
+            const lrGeo = createPerforatedWall(sideW, h, wallThick);
+            addMesh(lrGeo, boxOffsetX + outerW/2 - wallThick, y, 0, 0, Math.PI/2);
             addMesh(lrGeo, boxOffsetX - outerW/2, y, 0, 0, Math.PI/2);
 
-
         } else {
-            // --- SOLID WALLS (Optimized Extrusion) ---
             const shape = new THREE.Shape();
             shape.moveTo(-outerW/2, -outerD/2);
             shape.lineTo(outerW/2, -outerD/2);
@@ -740,8 +745,8 @@ export default function App() {
             shape.lineTo(-outerW/2, outerD/2);
             shape.lineTo(-outerW/2, -outerD/2);
             
-            const iw = outerW - (wall*2);
-            const id = outerD - (wall*2);
+            const iw = outerW - (wallThick*2);
+            const id = outerD - (wallThick*2);
             const inner = new THREE.Path();
             inner.moveTo(-iw/2, -id/2);
             inner.lineTo(iw/2, -id/2);
@@ -761,9 +766,7 @@ export default function App() {
         const { spacer, cap } = stack.rail;
         const spH = spacer.yMax - spacer.yMin;
         const spY = spacer.yMin;
-        
-        // CORRECTION: Spacer = Wall / 2.
-        const spThick = wall / 2;
+        const spThick = toScene(config.wall) / 2;
         
         const sideSpacer = new THREE.BoxGeometry(spThick, spH, outerD);
         addMesh(sideSpacer, boxOffsetX-(outerW/2)+(spThick/2), spY + spH/2, 0);
@@ -774,7 +777,7 @@ export default function App() {
 
         const cH = cap.yMax - cap.yMin;
         const cY = cap.yMin;
-        const capWidth = wall; // Cap covers spacer + ledge
+        const capWidth = toScene(config.wall); 
         
         const cSide = new THREE.BoxGeometry(capWidth, cH, outerD);
         addMesh(cSide, boxOffsetX-(outerW/2)+(capWidth/2), cY + cH/2, 0);
@@ -806,8 +809,10 @@ export default function App() {
             const plate = new THREE.BoxGeometry(outerW, thickness, outerD);
             addMesh(plate, lidX, thickness/2, 0, 0, 0, lidMaterial);
             if (insertDepth > 0) {
-                const innerW = outerW - (wall*2) - (config.tolerance || 0.01);
-                const innerD = outerD - (wall*2) - (config.tolerance || 0.01);
+                // Apply Tolerance Logic Here
+                const tol = toScene(config.tolerance);
+                const innerW = outerW - (toScene(config.wall)*2) - (tol !== undefined ? tol : 0.01);
+                const innerD = outerD - (toScene(config.wall)*2) - (tol !== undefined ? tol : 0.01);
                 const insert = new THREE.BoxGeometry(innerW, insertDepth, innerD);
                 addMesh(insert, lidX, thickness + insertDepth/2, 0, 0, 0, lidMaterial);
             }
@@ -932,31 +937,75 @@ export default function App() {
           addArrow(idStart, idEnd, red);
           addLabel(idStart.clone().lerp(idEnd, 0.5).add(new THREE.Vector3(0, 0.1, 0)), layout.innerD, red, "Int D");
           
-          // Internal Height (Red Vertical)
+          // Internal Height (Red Vertical) with compensation for Lid Insert
           const ihX = boxOffsetX - layout.innerW/2 + 0.2; 
           const ihZ = layout.innerD/2 - 0.2;
           const floorTop = stack.floor ? stack.floor.yMax : 0;
-          const iH = stack.wall.yMax - floorTop;
+          let iH = stack.wall.yMax - floorTop;
+          
+          // If Step Lid in Internal Mode, the wall is taller than requested capacity.
+          // Subtract the insert depth to show the *usable* height.
+          if (config.measureMode === 'internal' && config.lidType === 'step' && config.lidEnabled) {
+              iH -= toScene(config.lipDepth);
+          }
+
           const ihStart = new THREE.Vector3(ihX, floorTop, ihZ);
           const ihEnd = new THREE.Vector3(ihX, floorTop + iH, ihZ);
           addArrow(ihStart, ihEnd, red);
-          addLabel(ihStart.clone().lerp(ihEnd, 0.5).add(new THREE.Vector3(0.1, 0, -0.1)), iH, red, "Int H");
+          addLabel(ihStart.clone().lerp(ihEnd, 0.5).add(new THREE.Vector3(0.1, 0, -0.1)), iH, red, "Usable H");
       }
 
       // 5. Lid Dimensions
       if (stack.lid) {
           const lidX = (outerW / 2) + gap;
-          const { width: lW, depth: lD, thickness: lT } = stack.lid;
+          const { width: lW, depth: lD, thickness: lT, insertDepth, type } = stack.lid;
           
+          // Lid Width (Top)
           const lStart = new THREE.Vector3(lidX - lW/2, 0, lD/2 + 0.5);
           const lEnd = new THREE.Vector3(lidX + lW/2, 0, lD/2 + 0.5);
           addArrow(lStart, lEnd, blue);
           addLabel(lStart.clone().lerp(lEnd, 0.5).add(new THREE.Vector3(0, 0, 0.1)), lW, blue, "Lid W");
           
+          // Lid Depth (Z-axis) - Shifted right
+          const dStart = new THREE.Vector3(lidX + lW/2 + 1.0, 0, -lD/2);
+          const dEnd = new THREE.Vector3(lidX + lW/2 + 1.0, 0, lD/2);
+          addArrow(dStart, dEnd, blue);
+          addLabel(dStart.clone().lerp(dEnd, 0.5).add(new THREE.Vector3(0.1, 0, 0)), lD, blue, "Lid D");
+
+          // Lid Thickness
           const tStart = new THREE.Vector3(lidX + lW/2 + 0.2, 0, 0);
           const tEnd = new THREE.Vector3(lidX + lW/2 + 0.2, lT, 0);
           addArrow(tStart, tEnd, blue);
           addLabel(tStart.clone().lerp(tEnd, 0.5).add(new THREE.Vector3(0.1, 0, 0)), lT, blue, "Thick");
+
+          // Insert Dimensions (Tolerance Check)
+          if (type === 'step' && insertDepth > 0) {
+              const tol = toScene(config.tolerance);
+              const insertW = outerW - (toScene(config.wall)*2) - (tol !== undefined ? tol : 0.01);
+              
+              // Insert Width
+              const iStart = new THREE.Vector3(lidX - insertW/2, lT + insertDepth + 0.2, 0);
+              const iEnd = new THREE.Vector3(lidX + insertW/2, lT + insertDepth + 0.2, 0);
+              addArrow(iStart, iEnd, blue);
+              addLabel(iStart.clone().lerp(iEnd, 0.5).add(new THREE.Vector3(0, 0.1, 0)), insertW, blue, "Insert W");
+              
+              // Insert Depth Label (Vertical)
+              const idStart = new THREE.Vector3(lidX - lW/2 - 0.2, lT, 0);
+              const idEnd = new THREE.Vector3(lidX - lW/2 - 0.2, lT + insertDepth, 0);
+              addArrow(idStart, idEnd, blue);
+              addLabel(idStart.clone().lerp(idEnd, 0.5).add(new THREE.Vector3(-0.1, 0, 0)), insertDepth, blue, "Ins D");
+          }
+
+          // Lid Total Height
+          let totalLidH = lT;
+          if (type === 'step') totalLidH += insertDepth;
+          if (type === 'slide') totalLidH = lT * 2.5; 
+
+          // Shifted further left
+          const hStart = new THREE.Vector3(lidX - lW/2 - 1.0, 0, 0);
+          const hEnd = new THREE.Vector3(lidX - lW/2 - 1.0, totalLidH, 0);
+          addArrow(hStart, hEnd, blue);
+          addLabel(hStart.clone().lerp(hEnd, 0.5).add(new THREE.Vector3(-0.1, 0, 0)), totalLidH, blue, "Total H");
       }
 
   }, [layout, showMeasure, appMode, config, isMM]); 
@@ -965,7 +1014,7 @@ export default function App() {
     <div className="flex flex-col md:flex-row h-screen bg-gray-900 font-sans select-none text-gray-200 overflow-hidden">
         <div ref={mountRef} className="flex-1 relative bg-gray-900 min-w-0 min-h-0"></div>
         <div className="w-full md:w-80 h-2/5 md:h-full bg-gray-800 border-t md:border-t-0 md:border-l border-gray-700 p-6 overflow-y-auto flex-shrink-0 z-10 shadow-xl md:shadow-none">
-            <h1 className="text-xl font-bold text-white mb-6">BOX3D -- Parametric Box & Gridfinity Generator</h1>
+            <h1 className="text-xl font-bold text-white mb-6">BOX3D -- 3D Printable Box & Gridfinity Generator</h1>
             <SegmentedControl options={[ { label: 'Inch', value: 'in' }, { label: 'mm', value: 'mm' }, { label: 'Gridfinity', value: 'gridfinity' } ]} value={appMode} onChange={setAppMode} />
             
             <div className="mb-6 space-y-4">
@@ -983,25 +1032,28 @@ export default function App() {
                     </>
                 ) : (
                     <>
-                        <ControlInput label="Width" unitLabel={appMode} value={config.width} min={0.5} max={24} onChange={v => updateConfig('width', v)} />
-                        <ControlInput label="Depth" unitLabel={appMode} value={config.depth} min={0.5} max={24} onChange={v => updateConfig('depth', v)} />
-                        <ControlInput label="Height" unitLabel={appMode} value={config.height} min={0.5} max={24} onChange={v => updateConfig('height', v)} />
+                        <ControlInput label="Width" unitLabel={appMode} {...getDisplayProps('width', 0.5, 24)} />
+                        <ControlInput label="Depth" unitLabel={appMode} {...getDisplayProps('depth', 0.5, 24)} />
+                        <ControlInput label="Height" unitLabel={appMode} {...getDisplayProps('height', 0.5, 24)} />
                     </>
                 )}
             </div>
 
             {(!isGridfinity || config.gridfinityType === 'bin') && (
                 <div className="mb-6 space-y-4 pt-4 border-t border-gray-700">
-                    <ControlInput label="Wall Thickness" description="Structural walls" {...getStructProps('wall', 0.03, 0.5, 0.001)} />
-                    <ControlInput label="Floor Thickness" description="Bottom plate" {...getStructProps('floor', 0.03, 0.5, 0.001)} />
+                    <ControlInput label="Wall Thickness" description="Structural walls" {...getStructProps('wall', 0.03, 0.5)} />
+                    <ControlInput label="Floor Thickness" description="Bottom plate" {...getStructProps('floor', 0.03, 0.5)} />
                     
                     <div className="pt-2 pb-2">
                         <label className="flex items-center justify-between cursor-pointer mb-3">
-                            <span className="text-xs font-bold text-gray-300">Wall Pattern</span>
+                            <span className="text-xs font-bold text-gray-300">Hexagonal Perforations</span>
                             <input type="checkbox" checked={config.holes} onChange={e => updateConfig('holes', e.target.checked)} className="accent-blue-600" />
                         </label>
                         {config.holes && (
-                            <ControlInput label="Hex Hole Size" description="Diameter" {...getDisplayProps('holeSize', 0.1, 2.0, 0.01)} />
+                            <>
+                                <ControlInput label="Hex Size" description="Hole Diameter" {...getDisplayProps('holeSize', 0.1, 2.0)} />
+                                <ControlInput label="Wall Solidity" description="Structure remaining %" value={config.infill * 100} min={10} max={99} step={1} onChange={v => updateConfig('infill', v/100)} unitLabel="%" />
+                            </>
                         )}
                     </div>
 
@@ -1011,9 +1063,9 @@ export default function App() {
                             {config.lidEnabled && (
                                 <>
                                     <SegmentedControl options={[ { label: 'Step (Friction)', value: 'step' }, { label: 'Slide (Rail)', value: 'slide' } ]} value={config.lidType} onChange={v => updateConfig('lidType', v)} />
-                                    <ControlInput label="Lid Thickness" {...getDisplayProps('lidThickness', 0.04, 0.5, 0.001)} />
-                                    {config.lidType === 'step' && <ControlInput label="Insert Depth" description="Depth of plug" {...getDisplayProps('lipDepth', 0.04, 1.0, 0.01)} />}
-                                    <ControlInput label="Tolerance" description="Fit clearance" {...getDisplayProps('tolerance', 0.0, 0.05, 0.001)} />
+                                    <ControlInput label="Lid Thickness" {...getStructProps('lidThickness', 0.04, 0.5)} />
+                                    {config.lidType === 'step' && <ControlInput label="Insert Depth" description="Depth of plug" {...getStructProps('lipDepth', 0.04, 1.0)} /> }
+                                    <ControlInput label="Tolerance" description="Fit clearance" {...getStructProps('tolerance', 0.0, 0.05)} />
                                 </>
                             )}
                         </div>
